@@ -2,37 +2,40 @@
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::iter::zip;
-use std::pin::pin;
 use std::sync::Arc;
+use std::time::Instant;
 
-use anyhow::{Context as _, Result, bail, ensure};
-use bytes::BytesMut;
-use omnia_core::{ChainPolicy, GuestId, LinkClient, contains_resource};
-use tokio_util::codec::Encoder as _;
-use wasmtime::component::{Accessor, Linker, Type, Val, types};
-use wasmtime::{AsContextMut as _, Engine, StoreContextMut};
-use wasmtime_wasi::WasiView;
-use wrpc_transport::Invoke;
-use wrpc_wasmtime::{ValEncoder, WrpcView, read_value};
+use anyhow::{Context as _, Result, anyhow, bail, ensure};
+use omnia_core::{ChainPolicy, GuestId, InvokeError, handle_kind};
+use wasmtime::Engine;
+use wasmtime::component::{Linker, Type, Val, types};
 
-use super::decode::read_plain_value;
+use super::route::Routes;
 use super::selector::GuestSelector;
-use super::transport::{InProcess, LinkTransport as _};
 
 /// The functions polyfilled onto a linker — the union across guests at
 /// function granularity, since components import only the functions they use
 /// and so per-guest imports of one interface are arbitrary subsets. Keyed by
-/// interface then function name; the value is the function's type-level
-/// asyncness, so a later guest whose import disagrees is rejected instead of
-/// failing wasmtime's pre-instantiation typecheck with no cross-guest context.
-pub type WiredLinks = BTreeMap<Box<str>, BTreeMap<Box<str>, bool>>;
+/// interface then function name; the value records how the first importer
+/// declared the function, so a later guest whose import disagrees on
+/// asyncness is rejected instead of failing wasmtime's pre-instantiation
+/// typecheck with no cross-guest context, and an exporter's signature can be
+/// checked against the importer's when it is served.
+pub type WiredLinks = BTreeMap<Box<str>, BTreeMap<Box<str>, Wired>>;
+
+/// One polyfilled function as its first importer declared it.
+#[derive(Clone)]
+pub struct Wired {
+    pub ty: types::ComponentFunc,
+    pub importer: GuestId,
+}
 
 /// The caller-side state every polyfilled import shares: the selector
-/// strategy, the chain policy, and the bound transport carrier.
+/// strategy, the chain policy, and the live route table.
 pub struct Caller {
     pub selector: Arc<dyn GuestSelector>,
     pub policy: ChainPolicy,
-    pub transport: InProcess,
+    pub routes: Routes,
 }
 
 /// Polyfill one component's imports of the declared `interfaces` not already
@@ -48,24 +51,25 @@ pub struct Caller {
 /// `instantiate_pre`.
 ///
 /// Registration matches the import's type-level asyncness: a plain `func` is
-/// polyfilled with `func_new_async` ([`send`]), an `async func` with
-/// `func_new_concurrent` ([`send_concurrent`]) — the sync-typed registration
-/// would fail the pre-instantiation asyncness typecheck. A function an
-/// earlier guest wired with the *other* asyncness is a cross-guest interface
-/// disagreement, rejected here with both views named.
+/// polyfilled with `func_new_async`, an `async func` with
+/// `func_new_concurrent` — the sync-typed registration would fail the
+/// pre-instantiation asyncness typecheck. Both share one body ([`relay`]),
+/// which never touches the caller's store. A function an earlier guest wired
+/// with the *other* asyncness is a cross-guest interface disagreement,
+/// rejected here with both views named. A signature carrying a store-bound
+/// handle (resource, future, stream, error-context) is refused before it is
+/// wired: only plain values cross the seam.
 ///
 /// # Errors
 ///
-/// Returns an error if a named link target is not an interface import, or if a
-/// function cannot be defined on the linker.
-pub fn polyfill_component<T>(
+/// Returns an error if a named link target is not an interface import, a
+/// function's signature is not plain, or a function cannot be defined on the
+/// linker.
+pub fn polyfill_component<T: 'static>(
     engine: &Engine, linker: &mut Linker<T>, id: &GuestId,
     component: &wasmtime::component::Component, interfaces: &BTreeSet<Box<str>>,
     caller: &Arc<Caller>, wired: &mut WiredLinks,
-) -> Result<()>
-where
-    T: WasiView + WrpcView + 'static,
-{
+) -> Result<()> {
     let component_ty = component.component_type();
     for (name, types::ComponentExtern { ty, .. }) in component_ty.imports(engine) {
         if !interfaces.contains(name) {
@@ -79,21 +83,29 @@ where
         // borrowing the linker, skipping functions an earlier guest wired.
         let wired_funcs = wired.entry(Box::from(name)).or_default();
         let describe = |is_async: bool| if is_async { "an async func" } else { "a plain func" };
-        let mut funcs: Vec<(Arc<str>, bool)> = Vec::new();
+        let mut funcs: Vec<(Arc<str>, types::ComponentFunc)> = Vec::new();
         for (func, types::ComponentExtern { ty, .. }) in instance_ty.exports(engine) {
             let types::ComponentItem::ComponentFunc(ty) = ty else {
                 continue;
             };
             let is_async = ty.async_();
             match wired_funcs.get(func) {
-                Some(&earlier) if earlier == is_async => {}
-                Some(&earlier) => bail!(
+                Some(earlier) if earlier.ty.async_() == is_async => {}
+                Some(earlier) => bail!(
                     "guest `{id}` imports `{name}/{func}` as {}, but an earlier guest wired it \
                      as {}; every importer of a host-mediated function must agree on asyncness",
                     describe(is_async),
-                    describe(earlier),
+                    describe(earlier.ty.async_()),
                 ),
-                None => funcs.push((Arc::from(func), is_async)),
+                None => {
+                    if let Err(kind) = plain_signature(&ty) {
+                        bail!(
+                            "guest `{id}` imports `{name}/{func}` whose signature carries a \
+                             {kind}; only plain values cross the link seam"
+                        );
+                    }
+                    funcs.push((Arc::from(func), ty));
+                }
             }
         }
 
@@ -107,36 +119,28 @@ where
             .with_context(|| format!("defining host-mediated interface `{name}`"))?;
         let iface_name: Arc<str> = Arc::from(name);
 
-        for (func, is_async) in &funcs {
+        for (func, ty) in &funcs {
             let caller = Arc::clone(caller);
             let iface_name = Arc::clone(&iface_name);
             let func_name = Arc::clone(func);
-            let registered = if *is_async {
-                interface.func_new_concurrent(func, move |accessor, ty, params, results| {
+            let registered = if ty.async_() {
+                interface.func_new_concurrent(func, move |_accessor, ty, params, results| {
                     let caller = Arc::clone(&caller);
                     let iface_name = Arc::clone(&iface_name);
                     let func_name = Arc::clone(&func_name);
                     Box::pin(async move {
-                        send_concurrent(
-                            accessor,
-                            &caller,
-                            &iface_name,
-                            &func_name,
-                            &ty,
-                            params,
-                            results,
-                        )
-                        .await
-                        .map_err(wasmtime::Error::from_anyhow)
+                        relay(&caller, &iface_name, &func_name, &ty, params, results)
+                            .await
+                            .map_err(wasmtime::Error::from_anyhow)
                     })
                 })
             } else {
-                interface.func_new_async(func, move |store, ty, params, results| {
+                interface.func_new_async(func, move |_store, ty, params, results| {
                     let caller = Arc::clone(&caller);
                     let iface_name = Arc::clone(&iface_name);
                     let func_name = Arc::clone(&func_name);
                     Box::new(async move {
-                        send(store, &caller, &iface_name, &func_name, &ty, params, results)
+                        relay(&caller, &iface_name, &func_name, &ty, params, results)
                             .await
                             .map_err(wasmtime::Error::from_anyhow)
                     })
@@ -146,202 +150,195 @@ where
                 .map_err(anyhow::Error::from)
                 .with_context(|| format!("polyfilling `{name}` function `{func}`"))?;
         }
-        wired_funcs.extend(funcs.iter().map(|(func, is_async)| (Box::from(&**func), *is_async)));
+        wired_funcs.extend(funcs.into_iter().map(|(func, ty)| {
+            let wired = Wired {
+                ty,
+                importer: id.clone(),
+            };
+            (Box::from(&*func), wired)
+        }));
     }
     Ok(())
 }
 
-/// A prepared dispatch: everything [`send`] and [`send_concurrent`] share
-/// before they diverge on store threading.
-struct Call<'a> {
-    start: std::time::Instant,
-    target: GuestId,
-    forwarded: std::borrow::Cow<'a, [Val]>,
-    param_types: Vec<Type>,
-    result_types: Vec<Type>,
-    client: LinkClient,
-    // Whether this call's chain root runs uncapped (command mode): the
-    // round-trip then skips the `guest_timeout` wall-clock bound.
-    uncapped: bool,
-}
-
-/// Shared per-call preamble: select the target, reject crossing resources,
-/// take a depth slot, and open the client connection.
-fn prepare<'a>(
-    caller: &Caller, interface: &str, func: &str, ty: &types::ComponentFunc, params: &'a [Val],
-) -> Result<Call<'a>> {
-    let start = std::time::Instant::now();
+/// The per-call dispatch: select the target, reject crossing handles, take a
+/// depth slot, resolve the live route, and move the lifted parameters to a
+/// fresh callee instance on its own task, writing its results back.
+async fn relay(
+    caller: &Caller, interface: &str, func: &str, ty: &types::ComponentFunc, params: &[Val],
+    results: &mut [Val],
+) -> Result<()> {
+    let start = Instant::now();
 
     let (target, forwarded) = caller
         .selector
         .select(interface, func, params)
         .with_context(|| format!("selecting target for `{interface}/{func}`"))?;
 
-    // Plain records cross by value; a live resource handle never crosses.
-    for value in &*forwarded {
-        if contains_resource(value) {
-            bail!(
-                "a resource handle cannot cross the link seam (call to `{interface}/{func}`, \
-                 target `{target}`)"
-            );
-        }
+    // Plain records cross by value; a live handle never crosses.
+    if let Some(kind) = forwarded.iter().find_map(handle_kind) {
+        bail!(
+            "a {kind} handle cannot cross the link seam (call to `{interface}/{func}`, \
+             target `{target}`)"
+        );
     }
 
     let ctx = caller.policy.enter(&target)?;
 
-    let param_types: Vec<Type> = ty.params().map(|(_, ty)| ty).collect();
-    let result_types: Vec<Type> = ty.results().collect();
+    let expected = ty.params().len();
     ensure!(
-        forwarded.len() == param_types.len(),
-        "selector forwarded {} arguments but `{interface}/{func}` expects {}",
+        forwarded.len() == expected,
+        "selector forwarded {} arguments but `{interface}/{func}` expects {expected}",
         forwarded.len(),
-        param_types.len()
     );
 
-    let client = caller.transport.connect(&target, interface, ctx)?;
-
-    Ok(Call {
-        start,
-        target,
-        forwarded,
-        param_types,
-        result_types,
-        client,
-        uncapped: ctx.uncapped,
-    })
-}
-
-/// Encode the forwarded parameters with wRPC's value codec.
-fn encode_params<T: WrpcView + 'static>(
-    mut store: StoreContextMut<'_, T>, call: &Call<'_>, interface: &str, func: &str,
-) -> Result<BytesMut> {
-    let mut buf = BytesMut::new();
-    for (value, ty) in zip(&*call.forwarded, &call.param_types) {
-        let mut encoder = ValEncoder::new(store.as_context_mut(), ty, &[], &[]);
-        encoder
-            .encode(value, &mut buf)
-            .map_err(anyhow::Error::from)
-            .with_context(|| format!("encoding parameter for `{interface}/{func}`"))?;
-        ensure!(
-            encoder.deferred.is_none(),
-            "async/stream parameters cannot cross the link seam (`{interface}/{func}`)"
-        );
+    let route = caller.routes.resolve(&target, interface)?;
+    // A server-rooted chain is wall-clock bounded so a hung target cannot stall
+    // the caller; a command-rooted chain runs uncapped.
+    let bound = (!ctx.uncapped).then_some(caller.policy.timeout);
+    let out =
+        route.invoke(interface, func, forwarded.into_owned(), ctx, bound).await.map_err(|err| {
+            match err.downcast_ref::<InvokeError>() {
+                Some(InvokeError::Timeout(bound)) => anyhow!(
+                    "link dispatch to `{target}` for `{interface}/{func}` timed out after {bound:?}"
+                ),
+                _ => err,
+            }
+        })?;
+    for (slot, value) in zip(results, out) {
+        *slot = value;
     }
-    Ok(buf)
-}
 
-fn timeout_error(caller: &Caller, target: &GuestId, interface: &str, func: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "link dispatch to `{target}` for `{interface}/{func}` timed out after {:?}",
-        caller.policy.timeout
-    )
-}
-
-/// Await the dispatch round-trip, bounded by `guest_timeout` unless the call's
-/// chain root runs uncapped (a command-mode `wasi:cli/run` drive).
-async fn bounded<F>(
-    caller: &Caller, call: &Call<'_>, interface: &str, func: &str, fut: F,
-) -> Result<()>
-where
-    F: Future<Output = Result<()>>,
-{
-    if call.uncapped {
-        return fut.await;
-    }
-    tokio::time::timeout(caller.policy.timeout, fut)
-        .await
-        .map_err(|_elapsed| timeout_error(caller, &call.target, interface, func))?
-}
-
-fn log_dispatch(call: &Call<'_>, interface: &str, func: &str) {
-    let elapsed_us = u64::try_from(call.start.elapsed().as_micros()).unwrap_or(u64::MAX);
+    let elapsed_us = u64::try_from(start.elapsed().as_micros()).unwrap_or(u64::MAX);
     tracing::debug!(
-        target = %call.target,
+        target = %target,
         interface,
         func,
-        transport = "in-process",
+        depth = ctx.depth,
+        carrier = "in-memory",
         histogram.link_dispatch_duration_us = elapsed_us,
         monotonic_counter.link_dispatches = 1_u64,
         "dispatched host-mediated call",
     );
-}
-
-/// The per-call dispatch: select the target, reject crossing resources, bound
-/// depth, then round-trip the call over the in-process wRPC carrier to a
-/// freshly-instantiated target export.
-async fn send<T>(
-    mut store: StoreContextMut<'_, T>, caller: &Caller, interface: &str, func: &str,
-    ty: &types::ComponentFunc, params: &[Val], results: &mut [Val],
-) -> Result<()>
-where
-    T: WrpcView + 'static,
-{
-    let call = prepare(caller, interface, func, ty, params)?;
-    let buf = encode_params(store.as_context_mut(), &call, interface, func)?;
-
-    // Invoke over the carrier; the request is written and flushed here, the
-    // results stream back on `incoming`. No deferred (async) parameters, so the
-    // outgoing half carries nothing further and is dropped. On a server-rooted
-    // chain the round-trip is bounded by `guest_timeout` so a hung target
-    // cannot stall the caller; a command-rooted chain runs uncapped.
-    let target = &call.target;
-    let round_trip = async {
-        let (_outgoing, incoming) =
-            call.client.invoke((), interface, func, buf.freeze(), &[[]; 0]).await.with_context(
-                || format!("invoking link target `{target}` for `{interface}/{func}`"),
-            )?;
-
-        let mut incoming = pin!(incoming);
-        for (index, (value, ty)) in zip(results.iter_mut(), &call.result_types).enumerate() {
-            read_value(&mut store, &mut incoming, &[], &[], value, ty, &[index])
-                .await
-                .map_err(anyhow::Error::from)
-                .with_context(|| format!("decoding result {index} from `{target}`"))?;
-        }
-        anyhow::Ok(())
-    };
-    bounded(caller, &call, interface, func, round_trip).await?;
-
-    log_dispatch(&call, interface, func);
     Ok(())
 }
 
-/// The concurrent dual of [`send`], for async-typed imports.
-///
-/// The store threading is the whole difference: a concurrent host task only
-/// reaches the store synchronously via [`Accessor::with`], so parameters are
-/// encoded inside a single `with` (the encoder never awaits) and results are
-/// decoded store-free — sound because resources, the only values
-/// `wrpc_wasmtime::read_value` needs the store for, never cross the link seam.
-async fn send_concurrent<T>(
-    accessor: &Accessor<T>, caller: &Caller, interface: &str, func: &str,
-    ty: &types::ComponentFunc, params: &[Val], results: &mut [Val],
-) -> Result<()>
-where
-    T: WrpcView + 'static,
-{
-    let call = prepare(caller, interface, func, ty, params)?;
-    let buf = accessor
-        .with(|mut access| encode_params(access.as_context_mut(), &call, interface, func))?;
+/// Checks that every parameter and result type of `func` is a plain value,
+/// naming the kind (`resource`, `future`, `stream`, or `error-context`) of the
+/// first store-bound handle type the signature carries.
+fn plain_signature(func: &types::ComponentFunc) -> Result<(), &'static str> {
+    func.params().map(|(_, ty)| ty).chain(func.results()).try_for_each(|ty| plain_type(&ty))
+}
 
-    // Invoke over the carrier; see `send` for the streaming/timeout contract.
-    let target = &call.target;
-    let round_trip = async {
-        let (_outgoing, incoming) =
-            call.client.invoke((), interface, func, buf.freeze(), &[[]; 0]).await.with_context(
-                || format!("invoking link target `{target}` for `{interface}/{func}`"),
-            )?;
-
-        let mut incoming = pin!(incoming);
-        for (index, (value, ty)) in zip(results.iter_mut(), &call.result_types).enumerate() {
-            read_plain_value(&mut incoming, value, ty)
-                .await
-                .with_context(|| format!("decoding result {index} from `{target}`"))?;
+fn plain_type(ty: &Type) -> Result<(), &'static str> {
+    match ty {
+        Type::Own(_) | Type::Borrow(_) => Err("resource"),
+        Type::Future(_) => Err("future"),
+        Type::Stream(_) => Err("stream"),
+        Type::ErrorContext => Err("error-context"),
+        Type::List(list) => plain_type(&list.ty()),
+        Type::FixedLengthList(list) => plain_type(&list.ty()),
+        Type::Map(map) => plain_type(&map.key()).and_then(|()| plain_type(&map.value())),
+        Type::Record(record) => record.fields().try_for_each(|field| plain_type(&field.ty)),
+        Type::Tuple(tuple) => tuple.types().try_for_each(|ty| plain_type(&ty)),
+        Type::Variant(variant) => {
+            variant.cases().try_for_each(|case| case.ty.as_ref().map_or(Ok(()), plain_type))
         }
-        anyhow::Ok(())
-    };
-    bounded(caller, &call, interface, func, round_trip).await?;
+        Type::Option(option) => plain_type(&option.ty()),
+        Type::Result(result) => result
+            .ok()
+            .as_ref()
+            .map_or(Ok(()), plain_type)
+            .and_then(|()| result.err().as_ref().map_or(Ok(()), plain_type)),
+        Type::Bool
+        | Type::S8
+        | Type::U8
+        | Type::S16
+        | Type::U16
+        | Type::S32
+        | Type::U32
+        | Type::S64
+        | Type::U64
+        | Type::Float32
+        | Type::Float64
+        | Type::Char
+        | Type::String
+        | Type::Enum(_)
+        | Type::Flags(_) => Ok(()),
+    }
+}
 
-    log_dispatch(&call, interface, func);
-    Ok(())
+#[cfg(test)]
+mod tests {
+    use wasmtime::component::types::ComponentItem;
+    use wasmtime::component::{Component, types};
+    use wasmtime::{Config, Engine};
+
+    use super::plain_signature;
+
+    fn signatures() -> (Engine, Component) {
+        let mut config = Config::new();
+        config.wasm_component_model(true);
+        config.wasm_component_model_async(true);
+        let engine = Engine::new(&config).expect("engine");
+        let component = Component::new(
+            &engine,
+            r#"
+            (component
+              (import "sigs" (instance
+                (export "r" (type $r (sub resource)))
+                (type $rec-def (record (field "n" u32) (field "r" (own $r))))
+                (export "rec" (type $rec (eq $rec-def)))
+                (export "plain" (func (param "n" u32) (param "s" string) (result (list u8))))
+                (export "own" (func (param "r" (own $r))))
+                (export "borrow" (func (param "r" (borrow $r))))
+                (export "future" (func (result (future u32))))
+                (export "stream" (func (param "bytes" (stream u8))))
+                (export "nested" (func (param "rec" (option $rec))))
+              ))
+            )
+            "#,
+        )
+        .expect("type-only component");
+        (engine, component)
+    }
+
+    fn signature(engine: &Engine, component: &Component, name: &str) -> types::ComponentFunc {
+        let ComponentItem::ComponentInstance(sigs) =
+            component.component_type().get_import(engine, "sigs").expect("sigs import").ty
+        else {
+            panic!("sigs import is not an instance");
+        };
+        let (_, types::ComponentExtern { ty, .. }) =
+            sigs.exports(engine).find(|(func, _)| *func == name).expect(name);
+        match ty {
+            ComponentItem::ComponentFunc(func) => func,
+            other => panic!("{name} export is {other:?}"),
+        }
+    }
+
+    #[test]
+    fn plain_params_and_results() {
+        let (engine, component) = signatures();
+        assert_eq!(plain_signature(&signature(&engine, &component, "plain")), Ok(()));
+    }
+
+    #[test]
+    fn handle_kinds() {
+        let (engine, component) = signatures();
+        for (name, kind) in [
+            ("own", "resource"),
+            ("borrow", "resource"),
+            ("future", "future"),
+            ("stream", "stream"),
+        ] {
+            assert_eq!(plain_signature(&signature(&engine, &component, name)), Err(kind), "{name}");
+        }
+    }
+
+    #[test]
+    fn handle_nested_in_record() {
+        let (engine, component) = signatures();
+        assert_eq!(plain_signature(&signature(&engine, &component, "nested")), Err("resource"));
+    }
 }

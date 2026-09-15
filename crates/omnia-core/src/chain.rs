@@ -8,9 +8,8 @@ use crate::RuntimeOptions;
 use crate::registry::GuestId;
 
 tokio::task_local! {
-    // The context of the dispatch chain the current task is serving. Carried
-    // across the in-process carrier via the wRPC accept context and
-    // re-established around each served invocation, so concurrent, unrelated
+    // The context of the dispatch chain the current task is serving,
+    // re-established around each spawned callee task, so concurrent, unrelated
     // chains never share a depth budget or a wall-clock policy.
     static CHAIN_CTX: ChainCtx;
 }
@@ -28,7 +27,6 @@ pub struct ChainCtx {
 /// Run `fut` with the chain context carried over from an incoming dispatch, so
 /// nested host-mediated calls made while serving it count against the same
 /// chain and inherit its wall-clock policy.
-#[cfg(feature = "wrpc")]
 pub fn with_chain<F>(ctx: ChainCtx, fut: F) -> impl Future<Output = F::Output>
 where
     F: Future,
@@ -49,12 +47,6 @@ where
         },
         fut,
     )
-}
-
-/// The context of the dispatch chain currently being served (a capped root
-/// outside any scope).
-fn current_chain() -> ChainCtx {
-    CHAIN_CTX.try_with(|ctx| *ctx).unwrap_or_default()
 }
 
 /// The deployment-wide bounds on a dispatch chain: its maximum nesting depth
@@ -80,7 +72,8 @@ impl ChainPolicy {
     ///
     /// Returns an error if the hop would exceed `max_depth`.
     pub fn enter(&self, target: &GuestId) -> Result<ChainCtx> {
-        let current = current_chain();
+        // The chain currently being served; a capped root outside any scope.
+        let current = CHAIN_CTX.try_with(|ctx| *ctx).unwrap_or_default();
         let depth = current.depth + 1;
         if depth > self.max_depth {
             bail!(

@@ -7,6 +7,8 @@
 
 #![cfg(not(target_arch = "wasm32"))]
 
+use std::time::Duration;
+
 use anyhow::{Context as _, Result, bail};
 use omnia::wasmtime::component::Val;
 use omnia::{DeploymentBuilder, GuestArtifact, GuestEntry, GuestId, Manifest, Runtime, StoreCtx};
@@ -18,12 +20,18 @@ test_programs::foreach_link!();
 /// Boot a runtime over `guests` (assembled in order) with
 /// `omnia-test:link/ops` dispatched.
 async fn boot(guests: &[(&str, &str)]) -> Result<Runtime<()>> {
+    boot_with(guests, |builder| builder).await
+}
+
+/// `boot` with `configure` applied to the builder (dispatch depth, timeout).
+async fn boot_with(
+    guests: &[(&str, &str)], configure: impl FnOnce(DeploymentBuilder) -> DeploymentBuilder,
+) -> Result<Runtime<()>> {
     let mut manifest = Manifest::new().link(["omnia-test:link/ops"]);
     for (id, wasm) in guests {
         manifest = manifest.guest(GuestEntry::new(*id, *wasm));
     }
-    let deployment = DeploymentBuilder::new()
-        .manifest(manifest)
+    let deployment = configure(DeploymentBuilder::new().manifest(manifest))
         .build::<StoreCtx<()>>()
         .await
         .context("building deployment")?;
@@ -127,4 +135,93 @@ async fn link_full_registered_late() {
     // The bootstrap guest is untouched by the late wiring.
     let subset = call(&runtime, "partial", "poke", "still").await.expect("subset dispatch");
     assert_eq!(subset, "echoer pong: still");
+}
+
+// The relay takes the id `echoer` because `full` hard-codes `ping("echoer",
+// ..)` and the default selector routes on that argument; every relay hop then
+// re-dispatches to itself, consuming one depth unit per hop.
+#[tokio::test]
+async fn link_relay() {
+    let runtime = boot_with(
+        &[("echoer", test_programs::LINK_RELAY), ("full", test_programs::LINK_FULL)],
+        |builder| builder.max_dispatch_depth(3),
+    )
+    .await
+    .expect("deployment boots");
+
+    // `full` → relay (depth 1) → relay (depth 2): within the bound.
+    let answer = call(&runtime, "full", "poke", "1").await.expect("two-hop chain");
+    assert_eq!(answer, "echoer relayed to the end");
+
+    // The relay's own hop trips the bound, and the callee's trap propagates
+    // through the caller's polyfill with its text intact.
+    let err = call(&runtime, "full", "poke", "5").await.expect_err("chain exceeds the bound");
+    assert!(format!("{err:#}").contains("exceeds maximum"), "unexpected error: {err:#}");
+}
+
+// The sleeper takes the id `echoer` for the same reason as the relay. Only
+// the caller is awaited, so the test finishes well inside the 2 s the sleeper
+// would otherwise hold its store.
+#[tokio::test]
+async fn link_sleeper() {
+    let runtime = boot_with(
+        &[("echoer", test_programs::LINK_SLEEPER), ("full", test_programs::LINK_FULL)],
+        |builder| builder.guest_timeout(Duration::from_millis(50)),
+    )
+    .await
+    .expect("deployment boots");
+
+    let err = call(&runtime, "full", "poke", "sleep").await.expect_err("callee outlives the bound");
+    assert!(format!("{err:#}").contains("timed out"), "unexpected error: {err:#}");
+
+    // The target is still reachable after the timed-out call was abandoned.
+    let answer = call(&runtime, "full", "poke", "awake").await.expect("dispatch after timeout");
+    assert_eq!(answer, "echoer woke: awake");
+}
+
+// The skewed exporter takes the id `echoer` so `full`'s wired import of
+// `ping` is the one it is checked against; the mismatch is refused when the
+// exporter is served, so assembly fails before any call.
+#[tokio::test]
+async fn link_skewed() {
+    let Err(err) =
+        boot(&[("echoer", test_programs::LINK_SKEWED), ("full", test_programs::LINK_FULL)]).await
+    else {
+        panic!("skewed exporter was served");
+    };
+
+    let text = format!("{err:#}");
+    for needle in ["echoer", "full", "omnia-test:link/ops", "ping"] {
+        assert!(text.contains(needle), "`{needle}` missing from: {text}");
+    }
+}
+
+// The host→guest hop is depth 1, so with a bound of 3 the relay may hop twice
+// more: `2` lands exactly on the bound, `3` would need depth 4. Were the
+// dispatcher to restart the chain at 0, `3` would succeed.
+#[tokio::test]
+async fn relay_via_dispatcher() {
+    let runtime = boot_with(
+        &[("echoer", test_programs::LINK_RELAY), ("full", test_programs::LINK_FULL)],
+        |builder| builder.max_dispatch_depth(3),
+    )
+    .await
+    .expect("deployment boots");
+
+    let dispatch = |hops: &str| {
+        runtime.dispatcher().invoke(
+            GuestId::from("echoer"),
+            Some("omnia-test:link/ops".into()),
+            "ping".into(),
+            vec![Val::String("echoer".into()), Val::String(hops.to_owned())],
+        )
+    };
+
+    let answer = dispatch("2").await.expect("chain within the bound");
+    assert_eq!(answer, vec![Val::String("echoer relayed to the end".into())]);
+
+    // The over-bound hop fails inside a guest polyfill; its trap propagates
+    // back through every fresh callee to the dispatcher's caller.
+    let err = dispatch("3").await.expect_err("chain exceeds the bound");
+    assert!(format!("{err:#}").contains("exceeds maximum"), "unexpected error: {err:#}");
 }

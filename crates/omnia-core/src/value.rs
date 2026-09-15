@@ -1,17 +1,26 @@
-//! Guards on the plain component values that cross the link seam.
+//! The value walk that keeps store-bound handles from crossing the link seam.
 
 use wasmtime::component::Val;
 
-/// Recursively reports whether a value carries a live resource handle.
+/// Names the kind of the first store-bound handle a value carries, if any.
+/// Recursive.
 #[must_use]
-pub fn contains_resource(value: &Val) -> bool {
+pub fn handle_kind(value: &Val) -> Option<&'static str> {
     match value {
-        Val::Resource(_) => true,
-        Val::List(values) | Val::Tuple(values) => values.iter().any(contains_resource),
-        Val::Record(fields) => fields.iter().any(|(_, value)| contains_resource(value)),
+        Val::Resource(_) => Some("resource"),
+        Val::Future(_) => Some("future"),
+        Val::Stream(_) => Some("stream"),
+        Val::ErrorContext(_) => Some("error-context"),
+        Val::List(values) | Val::Tuple(values) | Val::FixedLengthList(values) => {
+            values.iter().find_map(handle_kind)
+        }
+        Val::Map(entries) => {
+            entries.iter().find_map(|(key, value)| handle_kind(key).or_else(|| handle_kind(value)))
+        }
+        Val::Record(fields) => fields.iter().find_map(|(_, value)| handle_kind(value)),
         Val::Variant(_, Some(value))
         | Val::Option(Some(value))
-        | Val::Result(Ok(Some(value)) | Err(Some(value))) => contains_resource(value),
-        _ => false,
+        | Val::Result(Ok(Some(value)) | Err(Some(value))) => handle_kind(value),
+        _ => None,
     }
 }

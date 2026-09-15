@@ -113,7 +113,7 @@ wasi = "wasi.dev"
 
 # --- Transport (optional) ----------------------------------------------
 [transport]
-default = "in-process"              # the only implemented transport
+default = "in-process"              # in-memory routing; the only implemented kind
 ```
 
 Field notes:
@@ -125,4 +125,4 @@ Field notes:
 - **`mount`** — preopened into *every* guest sandbox. CLI `--mount` entries layer on top; a duplicate guest-visible name wins over the manifest.
 - **`[[plugin.location]]`** — where the `omnia:plugins/loader` acquires packages: `{ name, path }` entries are named roots for path loads (all fold into one `PathMounts`, opened when the runtime assembles), `{ registry, config? }` the registry policy for package references (at most one): the default endpoint and, optionally, a wasm-pkg client configuration as TOML routing namespaces and packages to other registries; an entry mixing the two shapes is a parse error. Only a runtime whose `runtime!` declares a `plugin:` block beside `config:` installs them, and it must be built with omnia's `plugin` feature — a runtime without it refuses a manifest carrying any `[[plugin.location]]` entry at startup; with no entries every load refuses typed. A top-level `[[location]]` is a parse error naming `[[plugin.location]]`.
 - **`guest.routes`** — inbound routes targeting the declaring guest, one list per trigger: `http` prefixes (longest prefix wins), `messaging` topics and `websocket` routes (NATS-style: `*` one token, `>` the rest). Route tables are aggregated across guests at load. If a trigger has no routes and exactly one guest exports its handler, that guest is the catch-all. CLI routes are not yet parsed; a sole `wasi:cli/run` exporter receives command-mode invocations.
-- **`transport`** — `unix`, `nats`, and `quic` are reserved for distributed dispatch and rejected at load today.
+- **`transport`** — `in-process` (the default) is in-memory routing of lifted values to a fresh callee task. `unix`, `nats`, and `quic` are reserved for distributed dispatch and rejected at load today.
