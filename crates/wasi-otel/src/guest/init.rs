@@ -1,125 +1,47 @@
 //! Initialise OpenTelemetry
 
-use std::fmt;
 use std::sync::OnceLock;
 
-use ::tracing::{Event, Subscriber};
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Context, Result};
+use opentelemetry::global;
 use opentelemetry::trace::TracerProvider;
-use opentelemetry::{KeyValue, Value};
 use opentelemetry_sdk::Resource;
-use opentelemetry_sdk::metrics::SdkMeterProvider;
-use opentelemetry_sdk::trace::SdkTracerProvider;
 use tracing_opentelemetry::{MetricsLayer, layer as tracing_layer};
-use tracing_subscriber::filter::LevelFilter;
-use tracing_subscriber::fmt::FmtContext;
-use tracing_subscriber::fmt::format::{FormatEvent, FormatFields, Writer};
-use tracing_subscriber::fmt::time::{FormatTime, SystemTime};
+use tracing_subscriber::filter::{LevelFilter, filter_fn};
 use tracing_subscriber::layer::SubscriberExt;
-use tracing_subscriber::registry::LookupSpan;
 use tracing_subscriber::util::SubscriberInitExt;
-use tracing_subscriber::{EnvFilter, Registry, reload};
+use tracing_subscriber::{EnvFilter, Layer as _, Registry, reload};
 
-use crate::guest::generated::omnia::otel::{resource, types};
+use crate::guest::generated::omnia::otel::resource;
 use crate::guest::{metrics, tracing};
 
-static TRACING: OnceLock<SdkTracerProvider> = OnceLock::new();
-static METRICS: OnceLock<SdkMeterProvider> = OnceLock::new();
-static FILTER: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
+static TELEMETRY: OnceLock<Option<Telemetry>> = OnceLock::new();
 
-/// Initialize OpenTelemetry SDK and tracing subscriber.
+struct Telemetry {
+    filter: reload::Handle<EnvFilter, Registry>,
+    spans: tracing::SpanBuffer,
+    reader: metrics::Reader,
+}
+
+/// Run `f` inside the guest's telemetry lifecycle.
 ///
-/// The subscriber filters by `RUST_LOG`, defaulting to `error`, until
-/// [`set_filter`] replaces the filter.
-///
-/// # Errors
-///
-/// Returns an error if the telemetry system fails to initialize, such as if
-/// the OpenTelemetry exporter cannot be created or if setting the global
-/// subscriber fails.
-pub fn init() -> Result<Option<ExitGuard>> {
-    if TRACING.get().is_some() || METRICS.get().is_some() {
-        return Ok(None);
+/// The first `scope` in an instance initializes telemetry before calling `f`
+/// and exports every buffered span and recorded metric once the returned
+/// future completes; nested calls are pass-throughs. `#[instrument]` and
+/// `command!` route through it, so guests rarely call it directly.
+pub async fn scope<F: Future>(inner: impl FnOnce() -> F) -> F::Output {
+    let mut owner = false;
+    TELEMETRY.get_or_init(|| {
+        owner = true;
+        init().inspect_err(|error| eprintln!("telemetry not initialized: {error:#}")).ok()
+    });
+
+    let output = inner().await;
+    if owner {
+        flush().await;
     }
 
-    let resource: Resource = resource::resource().into();
-
-    let (filter_layer, filter_handle) = reload::Layer::new(filter(None)?);
-    // Default fmt prefixes every line with the current span, repeating
-    // `correlation_id` on every guest log.
-    let fmt_layer = tracing_subscriber::fmt::layer().event_format(WithoutCurrentSpan);
-    let registry = Registry::default().with(filter_layer).with(fmt_layer);
-
-    let tracer_provider = tracing::init(resource.clone());
-    let tracing_layer = tracing_layer().with_tracer(tracer_provider.tracer("global"));
-
-    let meter_provider = metrics::init(resource);
-    let metrics_layer = MetricsLayer::new(meter_provider.clone());
-
-    let registry = registry.with(tracing_layer).with(metrics_layer);
-
-    // Publish the providers only after the subscriber installs: a failed
-    // `try_init` (e.g. the embedder already set a global subscriber) must
-    // not leave the OnceLocks populated, or every later `init` would report
-    // `Ok(None)` instead of surfacing the error.
-    registry.try_init().context("issue initializing subscriber")?;
-
-    TRACING.set(tracer_provider).map_err(|_e| anyhow!("failed to set tracing provider"))?;
-    METRICS.set(meter_provider).map_err(|_e| anyhow!("failed to set metrics provider"))?;
-    FILTER.set(filter_handle).map_err(|_e| anyhow!("failed to set filter handle"))?;
-
-    Ok(Some(ExitGuard))
-}
-
-/// Replace the guest's tracing filter with `directives`, a `RUST_LOG` string.
-///
-/// Events after the call follow the new filter. A span already open keeps
-/// the verdict it entered under. The noisy-dependency mutes [`init`]
-/// installs stay in force.
-///
-/// # Errors
-///
-/// Returns an error if telemetry is not initialized or `directives` do not
-/// parse.
-pub fn set_filter(directives: &str) -> Result<()> {
-    let handle = FILTER.get().context("telemetry is not initialized")?;
-    handle.reload(filter(Some(directives))?).context("issue reloading the filter")
-}
-
-// The guest filter: `directives` when given, else `RUST_LOG`. The env arm
-// defaults to ERROR so error telemetry is never silently dropped (an empty
-// `EnvFilter` disables everything). Both arms carry the transport mutes.
-fn filter(directives: Option<&str>) -> Result<EnvFilter> {
-    let base = match directives {
-        Some(directives) => EnvFilter::builder().parse(directives)?,
-        None => {
-            EnvFilter::builder().with_default_directive(LevelFilter::ERROR.into()).from_env_lossy()
-        }
-    };
-    Ok(base
-        .add_directive("hyper=off".parse()?)
-        .add_directive("h2=off".parse()?)
-        .add_directive("tonic=off".parse()?))
-}
-
-struct WithoutCurrentSpan;
-
-impl<S, N> FormatEvent<S, N> for WithoutCurrentSpan
-where
-    S: Subscriber + for<'a> LookupSpan<'a>,
-    N: for<'a> FormatFields<'a> + 'static,
-{
-    fn format_event(
-        &self, ctx: &FmtContext<'_, S, N>, mut writer: Writer<'_>, event: &Event<'_>,
-    ) -> fmt::Result {
-        if SystemTime.format_time(&mut writer).is_err() {
-            writer.write_str("<unknown time>")?;
-        }
-        let meta = event.metadata();
-        write!(writer, " {} {}: ", meta.level(), meta.target())?;
-        ctx.format_fields(writer.by_ref(), event)?;
-        writeln!(writer)
-    }
+    output
 }
 
 /// Export buffered spans and recorded metrics to the host.
@@ -127,77 +49,71 @@ where
 /// Export failures are logged, never propagated: telemetry must not affect
 /// application logic. Safe to call when telemetry was never initialized.
 pub async fn flush() {
-    tracing::flush().await;
-    metrics::flush().await;
+    let Some(telemetry) = telemetry() else { return };
+    tracing::export(&telemetry.spans).await;
+    metrics::export(&telemetry.reader).await;
 }
 
-/// [`flush`] if `guard` owns the telemetry lifecycle, disarming it.
+/// Replace the guest's tracing filter with `directives`, a `RUST_LOG` string.
 ///
-/// The `#[instrument]` macro awaits this as the outermost instrumented
-/// function returns, so telemetry is exported before the surrounding export
-/// completes — including ahead of a `wasi:cli/exit` that bypasses `Drop`.
-pub async fn flush_guard(guard: Result<Option<ExitGuard>>) {
-    if let Ok(Some(guard)) = guard {
-        std::mem::forget(guard);
-        // The generated `wasi::export` futures are `!Send`; run them as a
-        // task on the single-threaded executor and await a `Send` signal so
-        // instrumented functions stay usable as `Send` handlers (e.g. axum).
-        let (tx, rx) = futures::channel::oneshot::channel();
-        wit_bindgen::spawn_local(async move {
-            flush().await;
-            let _ = tx.send(());
-        });
-        let _ = rx.await;
-    }
+/// Events after the call follow the new filter. A span already open keeps
+/// the verdict it entered under. The always-on mutes stay in force.
+///
+/// # Errors
+///
+/// Returns an error if telemetry is not initialized or `directives` do not
+/// parse.
+pub fn set_filter(directives: &str) -> Result<()> {
+    let telemetry = telemetry().context("telemetry is not initialized")?;
+    telemetry.filter.reload(filter(Some(directives))?).context("issue reloading the filter")
 }
 
-/// [`ExitGuard`] provides a guard to export telemetry data on drop.
-pub struct ExitGuard;
-
-impl Drop for ExitGuard {
-    fn drop(&mut self) {
-        // `Drop` cannot await and a blocking flush deadlocks when the guard
-        // drops as an async export completes (the block wins spawned work,
-        // such as a response-body writer, that only finishes after the
-        // export returns). Defer the export onto the surrounding
-        // component-model task instead; it runs after the export's result
-        // is returned and before the task exits.
-        wit_bindgen::spawn_local(flush());
-    }
+fn telemetry() -> Option<&'static Telemetry> {
+    TELEMETRY.get()?.as_ref()
 }
 
-impl From<types::Resource> for Resource {
-    fn from(value: types::Resource) -> Self {
-        let attrs = value.attributes.into_iter().map(Into::into).collect::<Vec<_>>();
-        let builder = Self::builder();
+fn init() -> Result<Telemetry> {
+    let resource: Resource = resource::resource().into();
 
-        if let Some(schema_url) = value.schema_url {
-            builder.with_schema_url(attrs, schema_url).build()
-        } else {
-            builder.with_attributes(attrs).build()
+    let (filter_layer, filter) = reload::Layer::new(filter(None)?);
+    let fmt_layer = tracing_subscriber::fmt::layer()
+        .with_writer(std::io::stderr)
+        .with_filter(filter_fn(|meta| !meta.is_span()));
+
+    let (tracer_provider, spans) = tracing::init(resource.clone());
+    let tracing_layer =
+        tracing_layer().with_tracer(tracer_provider.tracer("global")).with_threads(false);
+
+    let (meter_provider, reader) = metrics::init(resource);
+    let metrics_layer = MetricsLayer::new(meter_provider.clone());
+
+    Registry::default()
+        .with(filter_layer)
+        .with(fmt_layer)
+        .with(tracing_layer)
+        .with(metrics_layer)
+        .try_init()
+        .context("issue initializing subscriber")?;
+
+    global::set_tracer_provider(tracer_provider);
+    global::set_meter_provider(meter_provider);
+    Ok(Telemetry {
+        filter,
+        spans,
+        reader,
+    })
+}
+
+// The guest filter.
+fn filter(directives: Option<&str>) -> Result<EnvFilter> {
+    let base = match directives {
+        Some(directives) => EnvFilter::builder().parse(directives)?,
+        None => {
+            EnvFilter::builder().with_default_directive(LevelFilter::ERROR.into()).from_env_lossy()
         }
-    }
-}
+    };
 
-impl From<types::KeyValue> for KeyValue {
-    fn from(value: types::KeyValue) -> Self {
-        Self::new(value.key, value.value)
-    }
-}
-
-impl From<types::Value> for Value {
-    fn from(value: types::Value) -> Self {
-        match value {
-            types::Value::Bool(v) => Self::Bool(v),
-            types::Value::S64(v) => Self::I64(v),
-            types::Value::F64(v) => Self::F64(v),
-            types::Value::String(v) => Self::String(v.into()),
-            types::Value::BoolArray(items) => Self::Array(opentelemetry::Array::Bool(items)),
-            types::Value::S64Array(items) => Self::Array(opentelemetry::Array::I64(items)),
-            types::Value::F64Array(items) => Self::Array(opentelemetry::Array::F64(items)),
-            types::Value::StringArray(items) => Self::Array(opentelemetry::Array::String(
-                items.into_iter().map(Into::into).collect(),
-            )),
-        }
-    }
+    Ok(base
+        .add_directive("opentelemetry=off".parse()?)
+        .add_directive("opentelemetry_sdk=off".parse()?))
 }
